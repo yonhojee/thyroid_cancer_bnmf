@@ -1,0 +1,438 @@
+---
+title: 'excess_overlap'
+output: html_document
+date: "2024-07-11"
+---
+Pipeline
+1. Run permutations
+2. Collect permuted p-values
+3. Plot heatmap
+
+# 1. Run permutations
+```{bash}
+Rscript /Excess_overlap_perm_ENTEX_array.R
+Rscript /Excess_overlap_perm_Franke_array.R
+Rscript /Excess_overlap_perm_GTEx_array.R
+Rscript /Excess_overlap_perm_ImmGen_array.R
+Rscript /Excess_overlap_perm_Roadmap_array.R
+```
+
+# 2. Collect permuted p-values
+```{r}
+library(data.table);library(dplyr);library(tidyr);library(stats) # For one-tailed test
+library(readxl)
+
+calculate_EO <- function(cluster_annotations, cell_annotations, annot_name) {
+  k=5; cutoff=1.057017
+
+  best_nc = k
+
+  cts <- cell_annotations
+
+  df_excess_overlap <- data.frame()
+
+  Merge_All_Samples <- cluster_annotations
+
+  for(gs in c(1:nrow(cts))) { #
+    excess_overlap <- c()    
+    for(cs in 1:best_nc){
+      annot_autochr_cs <- Merge_All_Samples %>% 
+        dplyr::select(SNP,gs+1,cs+nrow(cts)+1) %>%
+        rename_with(.cols = c(2,3), ~c("annot2","annot1")) %>%
+        mutate(annot12 = annot1*annot2)
+      
+      excess_overlap_cs <- mean(annot_autochr_cs$annot12)/(mean(annot_autochr_cs$annot1)*mean(annot_autochr_cs$annot2))
+      excess_overlap <- c(excess_overlap,excess_overlap_cs)
+    }
+    
+    df_excess_overlap <- rbind(df_excess_overlap, excess_overlap)
+  }
+  df_excess_overlap <- as.data.frame(df_excess_overlap)
+  rownames(df_excess_overlap) <- cts$V1
+  colnames(df_excess_overlap) <- paste0("Cluster",1:best_nc)
+  
+  return(df_excess_overlap)
+}
+
+save_permuted_p <- function(cts_name, annot_name, num_iter){
+  k=5; cutoff=1.057017
+
+  best_nc = k
+  df <- read_excel(paste0("/bNMF/test_results/sorted_cluster_weights_K",k,"_rev.xlsx")) 
+  df_var <- df %>%
+    filter(!is.na(VAR_ID)) %>%
+    dplyr::select(1:(k+3)) %>%
+    dplyr::rename_at(vars(4:(k+3)), ~paste0("W", 1:k))
+  res_genes <- df_var
+  
+  dir="/ldsc/"
+  
+  cts <- fread(paste0(dir,cts_name,".ldcts"),header = F, sep = "\t", data.table = F) %>%
+    separate(V2,c("file_name","control"),",")
+  dir_annot <- paste0("/ldsc/Merged/",cts_name,"_1000Gv3_ldscores/")
+  
+  if(annot_name=="GTEx"){
+    cts_name="Multi_tissue_gene_expr";print(cts_name)
+    cell_annotations <- cts[1:which(cts$V1=="Whole_Blood"),]
+  }
+  if(annot_name=="Franke"){
+    cts_name="Multi_tissue_gene_expr";print(cts_name)
+    cell_annotations <- cts[(which(cts$V1=="Whole_Blood")+1):nrow(cts),]
+  }
+  if(annot_name=="ENTEX"){
+    cts_name="Multi_tissue_chromatin";print(cts_name)
+    cell_annotations <- cts[1:which(cts$V1=="Vagina_ENTEX__H3K4me3"),] 
+  }
+  if(annot_name=="Roadmap"){
+    cts_name="Multi_tissue_chromatin";print(cts_name)
+    cell_annotations <- cts[(which(cts$V1=="Vagina_ENTEX__H3K4me3")+1):nrow(cts),]
+  }
+  if(annot_name=="ImmGen"){
+    cts_name="ImmGen";print(cts_name)
+    cell_annotations <- cts
+  }
+  
+  #===========================================
+res_genes_bin <- data.frame(rsID=res_genes$rsID,
+                            ifelse(res_genes[,paste0("W", 1:k)]>cutoff,1,0))
+Merge_All_Samples <- fread(paste0(dir_annot,"All_",annot_name,".gz"),data.table = F) 
+cluster_annotations <- Merge_All_Samples %>%
+  left_join(.,res_genes_bin,by=c("SNP"="rsID")) %>%
+  mutate_at(vars(paste0("W", 1:k)), ~replace_na(., 0))
+  
+  #===========================================
+  # Function to calculate EO (custom based on your method)
+  observed_EO <- calculate_EO(cluster_annotations, cell_annotations, annot_name)
+  
+  num_permutations=10000
+  p_values_list <- list()
+  
+  # Loop over each cluster
+  for (i in c(1:k)) { # Number of clusters
+    print(paste0("Cluster ",i))
+    permuted_EO1 <- data.frame()
+    for(p in 1:num_iter){     # for(p in 1:20){
+      permuted_EO_matrix <- readRDS(paste0("/bNMF/permutation_66loci_k5/",annot_name,"_permuted_EO_matrix_",p,".rds"))
+
+      
+      ld_index_start = (p-1) * num_permutations/num_iter + 1  # ld_index_start = (p-1) * 500 + 1
+      ld_index_stop = ld_index_start + (num_permutations/num_iter-1)  # ld_index_stop = ld_index_start + 499 
+  
+      print(paste0("iter ",p,"; from ",ld_index_start,"; to ",ld_index_stop))
+      # Store permuted EO values for current cluster
+      permuted_EO <- lapply(permuted_EO_matrix[ld_index_start:ld_index_stop], function(x) x%>% dplyr::select(i) %>% as.data.frame())
+      
+      # Convert nested list to the dataframe by columns
+      permuted_EO10 <-  as.data.frame(do.call(cbind, permuted_EO))
+      permuted_EO1 <-  rbind(permuted_EO1,permuted_EO10)
+    
+    }
+    # Compute p-values for each element of the observed EO vector
+    p_values <- numeric(length(observed_EO[[i]]))
+    
+    for (j in 1:length(observed_EO[[i]])) {
+      # Compare the observed value to the permuted distribution (one-tailed test)
+      p_values[j] <- sum(as.numeric(permuted_EO1[j,]) >= observed_EO[[i]][j]) / num_permutations
+    }
+    
+    # Store p-values for this cluster
+    p_values_list[[i]] <- p_values
+  }
+  
+  saveRDS(p_values_list, paste0("/bNMF/permutation_66loci_k5/",annot_name,"_p_values_list.rds"))
+  
+}
+```
+
+```{r}
+k=5
+cts_list <- c("Multi_tissue_gene_expr","Multi_tissue_gene_expr",
+              "Multi_tissue_chromatin","Multi_tissue_chromatin",
+              "ImmGen")
+annot_list <- c("GTEx","Franke","Roadmap","ENTEX","ImmGen")
+```
+
+```{r}
+for(j in c(1,2,4,5)){
+  cts_name=cts_list[j]
+  annot_name=annot_list[j]
+  print(paste0("|======= ",cts_name," / ",annot_name," =======|"))
+  save_permuted_p(cts_name,annot_name,20)
+}
+
+for(j in c(3)){
+  cts_name=cts_list[j]
+  annot_name=annot_list[j]
+  print(paste0("|======= ",cts_name," / ",annot_name," =======|"))
+  save_permuted_p(cts_name,annot_name,num_iter = 50)
+}
+```
+
+```{r}
+get_qval <- function(cts_name,annot_name){
+  # 12/16/2024 k=6;cutoff=0.7773154 #15Dec2024 k=6;cutoff=0.7773154; 1/3/2025 k=7; cutoff=0.7188043#01/20/2025 k=7; cutoff=0.8742985. k=6; cutoff=0.9525897
+  k=5; cutoff=1.057017
+  best_nc = k
+
+  dir="/ldsc/"
+  cts <- fread(paste0(dir,cts_name,".ldcts"),header = F, sep = "\t", data.table = F) %>%
+    separate(V2,c("file_name","control"),",")
+  dir_annot <- paste0("/ldsc/Merged/",cts_name,"_1000Gv3_ldscores/")
+  
+  if(annot_name=="GTEx"){
+    cts_name="Multi_tissue_gene_expr";print(cts_name)
+    cell_annotations <- cts[1:which(cts$V1=="Whole_Blood"),]
+  }
+  if(annot_name=="Franke"){
+    cts_name="Multi_tissue_gene_expr";print(cts_name)
+    cell_annotations <- cts[(which(cts$V1=="Whole_Blood")+1):nrow(cts),]
+  }
+  if(annot_name=="ENTEX"){
+    cts_name="Multi_tissue_chromatin";print(cts_name)
+    cell_annotations <- cts[1:which(cts$V1=="Vagina_ENTEX__H3K4me3"),] 
+  }
+  if(annot_name=="Roadmap"){
+    cts_name="Multi_tissue_chromatin";print(cts_name)
+    cell_annotations <- cts[(which(cts$V1=="Vagina_ENTEX__H3K4me3")+1):nrow(cts),]
+  }
+  if(annot_name=="ImmGen"){
+    cts_name="ImmGen";print(cts_name)
+    cell_annotations <- cts
+  }
+  
+  p_values_list <- readRDS(paste0("/bNMF/permutation_66loci_k5/",annot_name,"_p_values_list.rds"))
+  p_values_df <-  as.data.frame(do.call(cbind, p_values_list))
+  q_values_df <- p_values_df*nrow(cell_annotations)
+  q_values_df[q_values_df>1] = 1
+  
+  colnames(q_values_df) <- paste0("Cluster",1:best_nc)
+  rownames(q_values_df) <- cell_annotations$V1
+  
+  # cell_annotations$V1[q_values_df[[1]]<0.05]
+  # cell_annotations$V1[q_values_df[[2]]<0.05]
+  # cell_annotations$V1[q_values_df[[3]]<0.05]
+  return(q_values_df)
+}
+
+get_observed_EO <- function(cts_name, annot_name){
+  # 12/16/2024 k=6;cutoff=0.7773154 #15Dec2024 k=6;cutoff=0.7773154; 1/3/2025 k=7; cutoff=0.7188043#01/20/2025 k=7; cutoff=0.8742985. k=6; cutoff=0.9525897
+  k=5; cutoff=1.057017
+
+  best_nc = k
+  df <- read_excel(paste0("/bNMF/test_results/sorted_cluster_weights_K",k,"_rev.xlsx")) 
+  df_var <- df %>%
+    filter(!is.na(VAR_ID)) %>%
+    dplyr::select(1:(k+3)) %>%
+    dplyr::rename_at(vars(4:(k+3)), ~paste0("W", 1:k))
+  res_genes <- df_var
+
+  dir="/ldsc/"
+  
+  cts <- fread(paste0(dir,cts_name,".ldcts"),header = F, sep = "\t", data.table = F) %>%
+    separate(V2,c("file_name","control"),",")
+  dir_annot <- paste0("/ldsc/Merged/",cts_name,"_1000Gv3_ldscores/")
+  
+  if(annot_name=="GTEx"){
+    cts_name="Multi_tissue_gene_expr";print(cts_name)
+    cell_annotations <- cts[1:which(cts$V1=="Whole_Blood"),]
+  }
+  if(annot_name=="Franke"){
+    cts_name="Multi_tissue_gene_expr";print(cts_name)
+    cell_annotations <- cts[(which(cts$V1=="Whole_Blood")+1):nrow(cts),]
+  }
+  if(annot_name=="ENTEX"){
+    cts_name="Multi_tissue_chromatin";print(cts_name)
+    cell_annotations <- cts[1:which(cts$V1=="Vagina_ENTEX__H3K4me3"),] 
+  }
+  if(annot_name=="Roadmap"){
+    cts_name="Multi_tissue_chromatin";print(cts_name)
+    cell_annotations <- cts[(which(cts$V1=="Vagina_ENTEX__H3K4me3")+1):nrow(cts),]
+  }
+  if(annot_name=="ImmGen"){
+    cts_name="ImmGen";print(cts_name)
+    cell_annotations <- cts
+  }
+  
+  #===========================================
+  res_genes_bin <- data.frame(rsID=res_genes$rsID,
+                              ifelse(res_genes[,paste0("W", 1:k)]>cutoff,1,0))
+  Merge_All_Samples <- fread(paste0(dir_annot,"All_",annot_name,".gz"),data.table = F) 
+  cluster_annotations <- Merge_All_Samples %>%
+    left_join(.,res_genes_bin,by=c("SNP"="rsID")) %>%
+    mutate_at(vars(paste0("W", 1:k)), ~replace_na(., 0))
+    
+  #===========================================
+  # Function to calculate EO (custom based on your method)
+  observed_EO <- calculate_EO(cluster_annotations, cell_annotations, annot_name)
+  return(observed_EO)
+}
+
+# Plot w/ perm_p
+qval2ast <- function(x) {
+  ifelse(x < 0.001, "***",
+         ifelse(x < 0.01, "**",
+                ifelse(x < 0.05, "*", "")))
+}
+
+rename_mapping <- c(
+  C1 = "Cluster2",
+  C2 = "Cluster3",
+  C3 = "Cluster4",
+  C4 = "Cluster1",
+  C5 = "Cluster5"
+)
+
+rename_and_select_clusters <- function(data, rename_mapping) {
+  data %>%
+    dplyr::rename(!!!rename_mapping) %>%  # Rename columns using the mapping
+    dplyr::select(all_of(names(rename_mapping)))  # Select only the renamed columns
+}
+```
+
+# 3. Plot heatmap
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+plot_heatmap <- function(cts_name, annot_name) {
+  k=5
+  # Load raw enrichment and q-value matrices
+  df_raw <- get_observed_EO(cts_name, annot_name)
+  df_qval_raw <- get_qval(cts_name, annot_name)
+
+  # Rename and select clusters
+  df <- rename_and_select_clusters(df_raw, rename_mapping)
+  df_qval <- rename_and_select_clusters(df_qval_raw, rename_mapping)
+  
+  # Apply row name cleaning EARLY to both df and df_qval
+  clean_rownames <- function(rn, annot_name) {
+    if (annot_name == "GTEx") {
+      rn <- gsub("_", " ", rn)
+    } else if (annot_name == "Franke") {
+      rn <- gsub("^A[0-9.]+", "", rn)
+      rn <- gsub("\\.", " ", rn)
+    } else if (annot_name == "ENTEX") {
+      rn <- gsub("([A-Za-z0-9])_+(?=ENTEX)", "\\1", rn, perl = TRUE)
+      rn <- gsub("_*ENTEX_*", "_", rn)
+      rn <- gsub("__+", "_", rn)
+      rn <- gsub("_$", "", rn)
+    } else if (annot_name == "Roadmap") {
+      rn <- gsub("_", " ", rn)
+      rn <- gsub("__", "_", rn)
+    }
+    return(rn)
+  }
+  
+  rownames(df) <- clean_rownames(rownames(df), annot_name)
+  rownames(df_qval) <- clean_rownames(rownames(df_qval), annot_name)
+
+  # Filter qval rows with at least one value < 0.05
+  qval_mask <- apply(df_qval, 1, function(x) any(x < 0.05, na.rm = TRUE))
+  df_qval_filt <- df_qval[qval_mask, ]
+
+  # Filter df to remove all-zero rows
+  nonzero_mask <- apply(df, 1, function(x) !all(x == 0))
+  df_filt <- df[nonzero_mask, ]
+
+  # Take intersection of both filters
+  common_rows <- intersect(rownames(df_filt), rownames(df_qval_filt))
+  df_top <- df_filt[common_rows, ]
+  df_qval_top <- df_qval_filt[common_rows, ]
+
+  # Identify "Thyroid"-related rows after filtering
+  thyroid_rows <- grep("Thyroid", rownames(df_filt), ignore.case = TRUE, value = TRUE)
+  
+  # Combine all: thyroid rows first, then top (50 - n) remaining
+  df_all <- df_filt[unique(c(thyroid_rows, common_rows)), ]
+  
+  # Sort by average of C1 and C2
+  df_all$Average <- rowMeans(df_all[, c("C1", "C2")])
+  df_top <- df_all[order(-df_all$Average), ][1:min(17, nrow(df_all)), ]
+  df_top$Average <- NULL
+  
+  # Match qvals to final df_top
+  df_qval_top <- df_qval_filt[rownames(df_top), ]
+
+  # Convert q-values to asterisk labels
+  df_qval_top <- as.data.frame(lapply(df_qval_top, qval2ast))
+
+  # Set color range
+  min_val <- min(df_top, na.rm = TRUE)
+  max_val <- max(df_top, na.rm = TRUE)
+  col_fun <- colorRamp2(c(min_val, max_val), c("white", "red"))
+
+  colnames(df_top) <- c(
+    "Thyroid Gland Dysfunction",
+    "Thyroid Overactivity",
+    "DNA Damage Response",
+    "Telomere Maintenance",
+    "Mixed Function")
+  
+  colnames(df_qval_top) <- colnames(df_top)
+  
+  h1 <- hcl.colors(k, palette = "Dynamic")
+
+  # Define colors for each trait (column)
+  column_colors <- c(
+    "Thyroid Gland Dysfunction" = h1[1],
+    "Thyroid Overactivity" = h1[2],
+    "DNA Damage Response" = h1[3],
+    "Telomere Maintenance" = h1[4],
+    "Mixed Function" = h1[5]
+  )
+
+  ha <- HeatmapAnnotation(
+    TraitColor = anno_simple(
+      names(df_top),
+      col = column_colors,
+      gp = gpar(col = "black")),
+    annotation_name_side = "right",
+    show_annotation_name = FALSE,
+    which = "column"
+  )
+  
+  # Customize display title
+  display_title <- if (annot_name == "ENTEX") "EN-TEx" else annot_name
+  
+  # Plot heatmap
+  ht <- Heatmap(
+    as.matrix(df_top),
+    name = "Enrichment",
+    col = col_fun,
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    show_row_names = TRUE,
+    show_column_names = FALSE,
+    row_names_gp = gpar(fontsize = 10),
+    column_names_gp = gpar(fontsize = 10),
+    bottom_annotation = ha,
+    heatmap_legend_param = list(title = "Enrichment"),
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      label <- df_qval_top[i, j]
+      if (!is.na(label) && label != "") {
+        grid.text(label, x, y, gp = gpar(fontsize = 15))
+      }
+    },
+    column_title = display_title,
+    column_title_gp = gpar(fontsize = 14, fontface = "bold")
+  )
+
+  assign(paste0("ht_", tolower(annot_name)), ht, envir = .GlobalEnv)
+
+}
+
+cts_list <- c("Multi_tissue_gene_expr", "Multi_tissue_gene_expr",
+              "Multi_tissue_chromatin", "Multi_tissue_chromatin", "ImmGen")
+annot_list <- c("GTEx", "Franke", "Roadmap", "ENTEX", "ImmGen")
+
+for (j in seq_along(cts_list)) {
+  plot_heatmap(cts_list[j], annot_list[j])
+}
+
+draw(ht_entex + ht_franke, heatmap_legend_side = "right")
+
+pdf(paste0("/tmp-data/combined_enrichment_k",k,".pdf"), width = 14, height = 8)
+draw(ht_gtex + ht_franke, heatmap_legend_side = "right")
+dev.off()
+print(paste0("saved /tmp-data/combined_enrichment_k",k,".pdf"))
+```

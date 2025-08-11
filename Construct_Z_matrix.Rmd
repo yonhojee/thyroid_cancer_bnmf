@@ -1,0 +1,247 @@
+---
+title: "construct_z"
+output: html_document
+date: "2024-07-01"
+---
+Pipeline
+1. Export SNP list to fetch
+2. Fetch SNP list from sumstats (fetch_*.sh)
+3. Load fetched sumstats and construct Z score matrix for each dataset
+4. Combine and export Z score
+
+```{r}
+library(data.table);library(dplyr);library(tidyr);library(readxl);library(stringr)
+```
+
+# LiftOver
+```{r}
+make_executable <- function(exe) {
+  Sys.chmod(exe, mode = (file.info(exe)$mode | "111"))
+  exe
+}
+liftOver <- make_executable(normalizePath("/liftOver/liftOver")) ##https://hgdownload-test.gi.ucsc.edu/goldenPath/hg38/liftOver/README.txt
+snp_modifyBuild1 <- function(info_snp, liftOver,
+                             from = NULL, to = NULL,
+                             check_reverse = TRUE) {
+  
+  if (!all(c("chr", "pos") %in% names(info_snp)))
+    stop("Expecting variables 'chr' and 'pos' in input 'info_snp'.")
+  
+  # Make sure liftOver is executable
+  liftOver <- make_executable(normalizePath(liftOver))
+  
+  # Need BED UCSC file for liftOver
+  info_BED <- with(info_snp, data.frame(
+    # sub("^0", "", c("01", 1, 22, "X")) -> "1"  "1"  "22" "X"
+    chrom = paste0("chr", sub("^0", "", chr)),
+    start = pos - 1L, end = pos,
+    id = seq_along(pos)))
+  
+  BED <- tempfile(fileext = ".BED")
+  bigreadr::fwrite2(stats::na.omit(info_BED),
+                    BED, col.names = FALSE, sep = " ", scipen = 50)
+  
+  # Need chain file
+  url <- paste0("https://hgdownload.soe.ucsc.edu/goldenPath/", from, "/liftOver/",
+                from, "To", tools::toTitleCase(to), ".over.chain.gz")
+  chain <- tempfile(fileext = ".over.chain.gz")
+  utils::download.file(url, destfile = chain, quiet = TRUE)
+  
+  # Run liftOver (usage: liftOver oldFile map.chain newFile unMapped)
+  lifted <- tempfile(fileext = ".BED")
+  system2(liftOver, c(BED, chain, lifted, tempfile(fileext = ".txt")))
+  
+  # Read the ones lifter + some QC
+  new_pos <- bigreadr::fread2(lifted, nThread = 1)
+  is_bad <- vctrs::vec_duplicate_detect(new_pos$V4) |
+    (new_pos$V1 != info_BED$chrom[new_pos$V4])
+  new_pos <- new_pos[which(!is_bad), ]
+  
+  pos0 <- info_snp$pos
+  info_snp$pos <- NA_integer_
+  info_snp$pos[new_pos$V4] <- new_pos$V3
+  
+  if (check_reverse) {
+    pos2 <- suppressMessages(
+      Recall(info_snp, liftOver, from = to, to = from, check_reverse = FALSE)$pos)
+    info_snp$pos[pos2 != pos0] <- NA_integer_
+  }
+  
+  message("%d variants have not been mapped.", sum(is.na(info_snp$pos)))
+  
+  info_snp
+}
+```
+
+# 1. Export SNP list to fetch
+```{r}
+sumstat1_leadSNPs <- fread(paste0("/leadSNPs.txt"), data.table = F) %>% #full data available in Supplementary Table 2
+  mutate(chrpos = paste(chr, pos, sep=":")) 
+
+fwrite(data.frame(sumstat1_leadSNPs$uniqID),"/bNMF/fetch_sumstats/all_harmonized_markers.tmp",col.names = F)
+fwrite(data.frame(sumstat1_leadSNPs$rsID),"/bNMF/fetch_sumstats/all_rsid.tmp",col.names = F)
+
+sumstat1_leadSNPs_hg38 <- snp_modifyBuild1(sumstat1_leadSNPs, liftOver, from = "hg19", to = "hg38", check_reverse = TRUE)
+sumstat1_leadSNPs_hg38 <- sumstat1_leadSNPs_hg38 %>%
+  separate(uniqID,c("CHR","pos_hg19","min_allele","max_allele"), sep = ":", remove = F) %>%
+  mutate(harmonized_SNP_hg38 = paste(chr, pos, min_allele, max_allele, sep=":")) 
+fwrite(data.frame(sumstat1_leadSNPs_hg38$harmonized_SNP_hg38),"/bNMF/fetch_sumstats/all_harmonized_markers_hg38.tmp",col.names = F)
+```
+
+# 2. Fetch SNP list from sumstats
+```{bash}
+sbatch /bNMF/fetch_meta.sh 
+sbatch /bNMF/fetch_finngen.sh 
+sbatch /bNMF/fetch_finngen_ukb.sh 
+sbatch /bNMF/fetch_finngen_ukb_mvp.sh 
+sbatch /bNMF/fetch_ukb_wget.sh 
+sbatch /bNMF/fetch_bbj.sh 
+sbatch /bNMF/fetch_gwascat.sh
+```
+
+# 3. Load fetched sumstats and construct Z score matrix for each dataset
+```{r}
+GWAS_sumstats_analyzed <- read_excel("/GWAS_sumstats_analyzed.xlsx") #full data available in Supplementary Table 4
+
+meta_df <- GWAS_sumstats_analyzed %>%
+  filter(str_starts(Biobanks, "KCPS2|ThyroidOmics"))
+finngen_bbj_df <- GWAS_sumstats_analyzed %>%
+  filter(str_starts(Biobanks, "finngen|bbj")) 
+ukb_df <- GWAS_sumstats_analyzed %>%
+  filter(str_starts(Biobanks, "ukb"))
+gwascat_df <- GWAS_sumstats_analyzed %>%
+  filter(str_starts(Biobanks, "gwascat"))
+
+trait_list1 <- meta_df$`File name`
+n_list1 <- meta_df$N
+term_list1 <- meta_df$Phenotype
+
+trait_list2 <- finngen_bbj_df$`File name`
+n_list2 <- finngen_bbj_df$N
+term_list2 <- finngen_bbj_df$Phenotype
+
+trait_list3 <- str_remove(ukb_df$`File name`, "\\.tsv\\.bgz$")
+n_list3 <- ukb_df$N
+term_list3 <- ukb_df$Phenotype
+
+trait_list4 <- gwascat_df$`File name`
+n_list4 <- gwascat_df$N
+term_list4 <- gwascat_df$Phenotype
+
+## META 
+trait_list1 <- meta_df$`File name`
+n_list1 <- meta_df$N
+term_list1 <- meta_df$Phenotype
+
+N_pheno1 <- data.frame(Phenotype=trait_list1,N=n_list1) %>%
+  pivot_wider(names_from = Phenotype, values_from = N) 
+N_pheno1 <- N_pheno1[rep(seq_len(nrow(N_pheno1)), each = nloci), ]
+
+z_mat1 <- sumstat1$BETA
+for(k in 2:length(trait_list1)){ 
+  print(trait_list1[k])
+  sumstat <- fread(paste0("/bNMF/fetch_sumstats/filtered_files/",trait_list1[k],"_filtered.tsv"), data.table = F, col.names = c("harmonized_SNP", "BETA", "SE", "EFFECT_ALLELE", "OTHER_ALLELE")) #RSID
+  input <- left_join(sumstat1,sumstat, by="harmonized_SNP", suffix=c("_1","_2")) %>%
+    mutate(z=BETA_2/SE_2) %>% # First, calculate z-score magnitude
+    mutate(z = case_when(  # Next, align z-score sign with GWAS phenotype-raising allele
+      EFFECT_ALLELE == Risk_Allele ~ z,
+      EFFECT_ALLELE == Nonrisk_Allele ~ -z,
+      TRUE ~ as.numeric(NA)  # For example, if trait effect allele matches neither REF nor ALT from GWAS
+    )) 
+  z_mat1 = cbind(z_mat1,input$z)
+}
+
+fwrite(z_mat1, paste0('/KCPS2/tmp_results/z_mat_META.txt'), sep = '\t') # before scaling
+
+## FinnGen
+trait_list2 <- finngen_bbj_df$`File name`
+n_list2 <- finngen_bbj_df$N
+term_list2 <- finngen_bbj_df$Phenotype
+
+N_pheno2 <- data.frame(Phenotype=trait_list2,N=n_list2) %>%
+  pivot_wider(names_from = Phenotype, values_from = N) 
+N_pheno2 <- N_pheno2[rep(seq_len(nrow(N_pheno2)), each = nloci), ]
+
+z_mat2 <- c()
+for(k in 1:length(trait_list2)){ 
+  print(trait_list2[k])
+  sumstat <- fread(paste0("/bNMF/fetch_sumstats/filtered_files/",trait_list2[k],"_filtered.tsv"), data.table = F, col.names = c("harmonized_SNP_hg38", "BETA", "SE", "EFFECT_ALLELE", "OTHER_ALLELE"))
+  input <- left_join(sumstat1,sumstat, by="harmonized_SNP_hg38", suffix=c("_1","_2")) %>%
+    mutate(z=BETA_2/SE_2) %>% # First, calculate z-score magnitude
+    mutate(z = case_when(  # Next, align z-score sign with GWAS phenotype-raising allele
+      EFFECT_ALLELE == Risk_Allele ~ z,
+      EFFECT_ALLELE == Nonrisk_Allele ~ -z,
+      TRUE ~ as.numeric(NA)  # For example, if trait effect allele matches neither REF nor ALT from GWAS
+    )) 
+  z_mat2 = cbind(z_mat2,input$z)
+}
+
+fwrite(z_mat2, paste0('/KCPS2/tmp_results/z_mat_FinnGen.txt'), sep = '\t') # before scaling
+
+## UKB
+trait_list3 <- str_remove(ukb_df$`File name`, "\\.tsv\\.bgz$")
+n_list3 <- ukb_df$N
+term_list3 <- ukb_df$Phenotype
+
+N_pheno3 <- data.frame(Phenotype=trait_list3,N=n_list3) %>%
+  pivot_wider(names_from = Phenotype, values_from = N) 
+N_pheno3 <- N_pheno3[rep(seq_len(nrow(N_pheno3)), each = nloci), ]
+
+z_mat3 <- c()
+for(k in 1:length(trait_list3)){ #5:10
+  print(trait_list3[k])
+  sumstat <- fread(paste0("/bNMF/fetch_sumstats/filtered_files/",trait_list3[k],"_filtered.tsv"), data.table = F, col.names = c("harmonized_SNP", "BETA", "SE", "EFFECT_ALLELE", "OTHER_ALLELE"))
+  input <- left_join(sumstat1,sumstat, by="harmonized_SNP", suffix=c("_1","_2")) %>%
+    mutate(z=BETA_2/SE_2) %>% # First, calculate z-score magnitude
+    mutate(z = case_when(  # Next, align z-score sign with GWAS phenotype-raising allele
+      EFFECT_ALLELE == Risk_Allele ~ z,
+      EFFECT_ALLELE == Nonrisk_Allele ~ -z,
+      TRUE ~ as.numeric(NA)  # For example, if trait effect allele matches neither REF nor ALT from GWAS
+    )) 
+  z_mat3 = cbind(z_mat3,input$z)
+}
+
+fwrite(z_mat3, paste0('/KCPS2/tmp_results/z_mat_UKB.txt'), sep = '\t') # before scaling
+
+z_mat_genes <- as.data.frame(cbind(z_mat3,sumstat1_genes$nearestGene))
+colnames(z_mat_genes) <- c(trait_list3,"nearestGene")
+z_mat_genes$RSID <- sumstat1$RSID
+z_mat_genes$Risk_Allele <- sumstat1$Risk_Allele
+z_mat_genes$Nonrisk_Allele <- sumstat1$Nonrisk_Allele
+
+## GWAS Catalog
+trait_list4 <- gwascat_df$`File name`
+n_list4 <- gwascat_df$N
+term_list4 <- gwascat_df$Phenotype
+
+N_pheno4 <- data.frame(Phenotype=trait_list4,N=n_list4) %>%
+  pivot_wider(names_from = Phenotype, values_from = N) 
+N_pheno4 <- N_pheno4[rep(seq_len(nrow(N_pheno4)), each = nloci), ]
+
+z_mat4 <- c()
+for(k in 1:length(trait_list4)){ 
+  print(trait_list4[k])
+  sumstat <- fread(paste0("/bNMF/fetch_sumstats/filtered_files/",trait_list4[k],"_filtered.tsv"), data.table = F, col.names = c("harmonized_SNP_hg38", "BETA", "SE", "EFFECT_ALLELE", "OTHER_ALLELE"))
+  input <- left_join(sumstat1,sumstat, by="harmonized_SNP_hg38", suffix=c("_1","_2")) %>%
+    filter(!duplicated(RSID)) %>%
+    mutate(z=BETA_2/SE_2) %>% # First, calculate z-score magnitude
+    mutate(z = case_when(  # Next, align z-score sign with GWAS phenotype-raising allele
+      EFFECT_ALLELE == Risk_Allele ~ z,
+      EFFECT_ALLELE == Nonrisk_Allele ~ -z,
+      TRUE ~ as.numeric(NA)  # For example, if trait effect allele matches neither REF nor ALT from GWAS
+    )) 
+  z_mat4 = cbind(z_mat4,input$z)
+}
+
+fwrite(z_mat4, paste0('/tmp_results/z_mat_GWASCat.txt'), sep = '\t') # before scaling
+```
+
+# 4. Combine and export Z score matrix
+```{r}
+z_mat <- cbind(z_mat1,z_mat2,z_mat3,z_mat4)
+N_pheno <- cbind(N_pheno1,N_pheno2,N_pheno3,N_pheno4)
+
+fwrite(z_mat, paste0('/tmp_results/z_mat_META_FinnGen_UKB_MVP_GHI_LAT_PMBB.txt'), sep = '\t') # before scaling
+fwrite(N_pheno, paste0('/tmp_results/N_pheno_META_FinnGen_UKB_MVP_GHI_LAT_PMBB.txt'), sep = '\t') # before scaling
+```
+

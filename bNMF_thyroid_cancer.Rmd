@@ -1,0 +1,238 @@
+---
+title: "bNMF thyroid cancer"
+author: "Yon Ho Jee"
+date: "2024-07-15"
+output: html_document
+---
+Pipeline - This is a modified pipeline available in https://github.com/gwas-partitioning/bnmf-clustering/blob/master/scripts/bNMF_example_pipeline.R. 
+1. Load constructed Z score matrix (Construct_Z_matrix.Rmd)
+2. Prepare the final z-score matrix (https://github.com/gwas-partitioning/bnmf-clustering/blob/master/scripts/prep_bNMF.R)
+3. Run bNMF and export the results in html (https://github.com/gwas-partitioning/bnmf-clustering/blob/master/scripts/run_bNMF.R)
+4. Summarize bNMF output into a table
+
+```{r}
+library(data.table);library(dplyr);library(tidyr)
+library(ggplot2);library(tidyverse)
+```
+
+```{r}
+# load requires packages
+# install.packages("pacman")
+pacman::p_load(tidyverse, data.table, readxl, magrittr, dplyr, strex,
+               rstudioapi, DT, kableExtra, GenomicRanges)
+
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+# load project scripts containing bNMF functions - downloaded from https://github.com/gwas-partitioning/bnmf-clustering/tree/master/scripts
+source("/bnmf-clustering/scripts/prep_bNMF.R")  # prep_z_matrix
+source("/bnmf-clustering/scripts/run_bNMF.R")  # run_bNMF & summarize_bNMF
+```
+
+# 1.Load constructed Z score matrix
+```{r}
+GWAS_sumstats_analyzed <- read_excel("/Thyroid/bNMF/GWAS_sumstats_analyzed.xlsx")
+
+meta_df <- GWAS_sumstats_analyzed %>%
+  filter(str_starts(Biobanks, "KCPS2|ThyroidOmics"))
+finngen_bbj_df <- GWAS_sumstats_analyzed %>%
+  filter(str_starts(Biobanks, "finngen|bbj")) 
+ukb_df <- GWAS_sumstats_analyzed %>%
+  filter(str_starts(Biobanks, "ukb"))
+gwascat_df <- GWAS_sumstats_analyzed %>%
+  filter(str_starts(Biobanks, "gwascat"))
+
+trait_list1 <- meta_df$`File name`
+n_list1 <- meta_df$N
+term_list1 <- meta_df$Phenotype
+
+trait_list2 <- finngen_bbj_df$`File name`
+n_list2 <- finngen_bbj_df$N
+term_list2 <- finngen_bbj_df$Phenotype
+
+trait_list3 <- str_remove(ukb_df$`File name`, "\\.tsv\\.bgz$")
+n_list3 <- ukb_df$N
+term_list3 <- ukb_df$Phenotype
+
+trait_list4 <- gwascat_df$`File name`
+n_list4 <- gwascat_df$N
+term_list4 <- gwascat_df$Phenotype
+```
+
+```{r}
+sumstat1_leadSNPs <- fread(paste0("/leadSNPs.txt"), data.table = F) %>% #full data available in Supplementary Table 2
+  mutate(
+    min_allele = pmin(ref, alt),
+    max_allele = pmax(ref, alt),
+    harmonized_SNP_hg38 = paste(chrom, pos, min_allele, max_allele, sep=":")) %>%
+  dplyr::rename(chr=chrom) 
+
+alignment_GWAS_summStats <- sumstat1_leadSNPs %>%
+  dplyr::rename(RSID=rsid) %>%
+  mutate(SNP=paste0(CHR,":",pos_hg19),
+         Risk_Allele = ifelse(BETA>=0, EFFECT_ALLELE, OTHER_ALLELE),
+         Nonrisk_Allele = ifelse(BETA>=0, OTHER_ALLELE, EFFECT_ALLELE),
+         Risk_Allele_Orig = Risk_Allele,
+         ALT=EFFECT_ALLELE, 
+         REF=OTHER_ALLELE,
+         BETA_new = ifelse(BETA>=0, BETA, -BETA),
+         FREQ_new = ifelse(BETA>=0, Freq1, 1-Freq1)) %>%
+  dplyr::rename(P_VALUE=P) %>%
+  dplyr::select(SNP,Risk_Allele_Orig,ALT,REF,Risk_Allele,Nonrisk_Allele,P_VALUE,BETA_new) %>%
+  dplyr::rename(BETA=BETA_new)  
+  
+#write_csv(x = alignment_GWAS_summStats,
+#          file = file.path("/bNMF/test_results/alignment_GWAS_summStats.csv"))
+#alignment_GWAS_summStats <- fread("/bNMF/test_results/alignment_GWAS_summStats.csv", data.table = F)
+```
+
+```{r}
+trait_list <- c(term_list1[-1],term_list2,term_list3,term_list4)
+
+z_mat <- fread(paste0('/tmp_results/z_mat_META_FinnGen_UKB_MVP_GHI_LAT_PMBB_autoreport.txt'), data.table = F)
+
+z_mat <- as.matrix(z_mat[,-1])
+rownames(z_mat) <- alignment_GWAS_summStats$SNP
+colnames(z_mat) <- trait_list
+
+N_pheno <- fread(paste0('/tmp_results/N_pheno_META_FinnGen_UKB_MVP_GHI_LAT_PMBB_autoreport.txt'), data.table = F)
+
+N_mat <- as.matrix(N_pheno, nrow=nloci, ncol=ncol(N_pheno))
+N_mat <- as.matrix(N_mat[,-1])
+rownames(N_mat) <- alignment_GWAS_summStats$SNP
+colnames(N_mat) <- trait_list
+
+initial_zscore_matrices_final <- list(z_mat=z_mat,N_mat=N_mat)
+```
+
+# 2. Prepare the final z-score matrix (Section 10. Generate non-negative z-score matrix)
+```{r}
+prep_z_output <- prep_z_matrix(z_mat = initial_zscore_matrices_final$z_mat,
+                               N_mat = initial_zscore_matrices_final$N_mat,
+                               corr_cutoff = 0.8)
+
+#   1.) The scaled, non-negative z-score matrix
+final_zscore_matrix <- prep_z_output$final_z_mat
+
+#   2.) Results from the trait filtering
+df_traits_filtered <- prep_z_output$df_traits
+write_csv(x = df_traits_filtered,
+          file = file.path(project_dir,"df_traits.csv"))
+
+# prep_z_matrix also save trait correlation matrix to working dir, so move to project dir
+system(sprintf("mv trait_cor_mat.txt %s", project_dir))
+
+print(sprintf("Final matrix: %i SNPs x %i traits",
+      nrow(final_zscore_matrix),
+      ncol(final_zscore_matrix)/2))
+
+save.image(file = file.path(project_dir, "pipeline_data.RData"))
+```
+
+# 3. Run bNMF and summarize the results (Section 11. Run bNMF) 
+```{r}
+start=Sys.time()
+
+bnmf_reps <- run_bNMF(final_zscore_matrix,
+                      n_reps=100,
+                      tolerance = 1e-6)
+summarize_bNMF(bnmf_reps, dir_save=project_dir)
+
+save.image(file = file.path(project_dir, "pipeline_data.RData"))
+
+end=Sys.time()
+print("Total pipeline runtime:")
+print(end-start)
+#----
+```
+
+```{r}
+gwas_traits <- NULL
+
+meta_studies = "KCPS2_GBMI_FinnGen_MVP_ukb_out_GHI_LAT_PMBB"
+
+rsID_map <- sumstat1_leadSNPs %>%
+  left_join(meta_res,by=c("harmonized_SNP_hg38"="SNP")) %>%
+  left_join(sumstat1_leadSNPs_hg19 %>% dplyr::select(harmonized_SNP_hg38, harmonized_SNP,pos_hg19), by ="harmonized_SNP_hg38") %>%
+  dplyr::rename(rsID=rsid) %>%
+  mutate(VAR_ID=paste0(CHR,"_",pos_hg19,"_",OTHER_ALLELE,"_",EFFECT_ALLELE)) %>%
+  dplyr::select(VAR_ID,rsID)
+fwrite(rsID_map,file.path(project_dir, "rsID_map.txt"),sep = "\t")
+```
+
+```{r}
+setwd("/bNMF")
+
+# format results
+k <- NULL; date <- today() 
+if (is.null(k)){
+  html_filename <- sprintf("results_for_maxK_%s.html", date)
+} else {
+  html_filename <- sprintf("results_for_K_%i_%s.html", k, date)
+}
+# https://github.com/gwas-partitioning/bnmf-clustering/blob/master/scripts/format_bNMF_results.Rmd
+rmarkdown::render(
+  '/bnmf-clustering/scripts/format_bNMF_results.Rmd',
+  output_file = html_filename,
+  params = list(main_dir = project_dir,
+                k = k,
+                loci_file="query",
+                GTEx=F,
+                my_traits=gwas_traits)
+)
+```
+/bnmf-clustering/scripts/results_for_maxK.html
+/bNMF/test_results
+
+# 4. Summarize bNMF output into a table
+```{r}
+out_df <- read_excel(paste0(project_dir,"/sorted_cluster_weights_K",k,"_rev.xlsx")) 
+var_w <- out_df %>%
+  filter(!is.na(VAR_ID)) %>%
+  dplyr::select(1:(k+3)) %>%
+  dplyr::rename_at(vars(4:(k+3)), ~paste0("Cluster", 1:k))
+pheno_w <- out_df %>%
+  filter(!is.na(trait)) %>%
+  dplyr::select((k+6):(k+6+k)) %>%
+ mutate(trait = gsub("_pos$", "(+)", trait),
+        trait = gsub("_neg$", "(-)", trait)) %>%
+  dplyr::rename_at(vars(2:(k+1)), ~paste0("Cluster", 1:k))
+```
+
+```{r}
+#
+# Initialize an empty list to store the results
+cluster_summary <- lapply(1:k, function(cluster) {
+  cluster_col <- paste0("Cluster", cluster)
+  
+  # Number of variants for the cluster
+  num_variants <- sum(var_w[[cluster_col]] > cutoff, na.rm = TRUE)
+  
+  # Key top-weighted traits for the cluster
+  top_traits <- pheno_w %>%
+    filter(!!sym(cluster_col) > cutoff) %>%
+    arrange(desc(!!sym(cluster_col))) %>%
+    pull(trait)
+  
+  # Key top-weighted loci for the cluster
+  top_loci <- var_w %>%
+    filter(!!sym(cluster_col) > cutoff) %>%
+    arrange(desc(!!sym(cluster_col))) %>%
+    pull(gene) %>%
+    unique()
+  
+  # Return the results for the cluster
+  data.frame(
+    Cluster = cluster_col,
+    `Number of variants` = num_variants,
+    `Key top-weighted traits` = paste(top_traits, collapse = ", "),
+    `Key top-weighted loci` = paste(top_loci, collapse = ", ")
+  )
+})
+
+# Combine results for all clusters into a single data frame
+final_table <- do.call(rbind, cluster_summary)
+
+# Optionally, save the table to a CSV or TSV file
+write.csv(final_table, paste0(project_dir,"/cluster_summary_table_",k,"_",date,".csv"), row.names = FALSE)
+```
