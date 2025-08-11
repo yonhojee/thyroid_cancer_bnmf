@@ -1,0 +1,30 @@
+TRACKPOSITIONS ON
+AVERAGEFREQ ON
+MINMAXFREQ ON
+SCHEME STDERR
+
+MARKER   harmonized_MARKER
+ALLELE   EFFECT_ALLELE OTHER_ALLELE
+EFFECT   BETA
+STDERR   SE
+PVALUE   P
+CHROMOSOMELABEL  CHR
+POSITIONLABEL    POS
+
+CUSTOMVARIABLE TotalSampleSize
+LABEL TotalSampleSize as N
+
+PROCESS  /GBMI/gbmi_ThC_finn_out_hg38_harmonized.txt.gz
+PROCESS  /FinnGen/ThC/mvp_ukbb/finngen_mvp_ThC_ukb_out_hg38_harmonized.txt.gz
+PROCESS  /KCPS2/GWAS_output/kcps2_ThC_hg38_harmonized.txt.gz
+PROCESS  /GBMI/ghi_ThC_hg38_harmonized.txt.gz
+PROCESS  /GBMI/latvian_ThC_hg38_harmonized.txt.gz
+PROCESS  /GBMI/pmbb_ThC_hg38_harmonized.txt.gz
+
+OUTFILE /KCPS2/GWAS_output/MA_KCPS2_GBMI_FinnGen_MVP_ukb_GHI_LAT_PMBB .tbl
+
+ANALYZE HETEROGENEITY
+
+QUIT
+
+
