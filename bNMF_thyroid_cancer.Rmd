@@ -145,7 +145,10 @@ print("Total pipeline runtime:")
 print(end-start)
 #----
 ```
-As detailed in https://github.com/gwas-partitioning/bnmf-clustering/blob/master/scripts/run_bNMF.R, the final results were not based on a single initialization but on repeated bNMF runs of up to 10,000 iterations, with convergence monitored for each chain. Across n_reps (50) independent runs, the most frequently observed number of clusters (K) at convergence was selected as the final model, with support from posterior evidence. After selection of the optimal K, bNMF was re-run using this fixed value to obtain the final factorization. In each bNMF run, the factor matrices W and H were initialized with nonnegative values from independently and identically distributed according to a uniform (0,1) distribution and scaled by the maximum value of the input matrix, following the original automatic relevance determination NMF formulation (Tan and Févotte, 2013) and prior applications in genetic clustering (Udler et al., 2018).
+As detailed in https://github.com/gwas-partitioning/bnmf-clustering/blob/master/scripts/run_bNMF.R, the final results were not based on a single initialization but on repeated bNMF runs of up to 10,000 iterations, with convergence monitored for each chain. 
+Across n_reps (50) independent runs, the most frequently observed number of clusters (K) at convergence was selected as the final model, with support from posterior evidence. 
+After selection of the optimal K, bNMF was re-run using this fixed value to obtain the final factorization. 
+In each bNMF run, the factor matrices W and H were initialized with nonnegative values from independently and identically distributed according to a uniform (0,1) distribution and scaled by the maximum value of the input matrix, following the original automatic relevance determination NMF formulation (Tan and Févotte, 2013) and prior applications in genetic clustering (Udler et al., 2018).
 
 ## Convergence plots for bNMF runs using n.error and n.lambda
 ```{r}
