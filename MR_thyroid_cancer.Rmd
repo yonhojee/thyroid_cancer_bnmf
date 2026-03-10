@@ -1,0 +1,302 @@
+---
+title: "MR"
+author: "Yon Ho Jee"
+date: "2026-01-04"
+output: html_document
+---
+```{r}
+library(data.table);library(dplyr);library(tidyr)
+library(ggplot2);library(tidyverse);library(readxl)
+```
+
+# Exposure=Hyperthyroidism (Graves disease)
+FinnGen-MVP-UKBB meta-analysis (https://public-mvp-ukbb.finngen.fi/pheno/E4_THYTOXGOITDIF)
+```{r}
+exposure_leadSNPs <- fread("~/Thyroid/replication/E4_THYTOXGOITDIF.tsv") #hg38
+```
+
+# Exposure=TSH
+ThyroidOmics Consortium website (https://genepi.med.uni-greifswald.de/thyroidomics/)
+```{r}
+exposure_leadSNPs <- fread("~/Thyroid/MR/Sterenborg_2024_TSH_leadSNPs.txt") %>% 
+  rename(chrom=Chr, pos=Position, ref=A2, alt=A1, rsids=`Genetic variant`, nearest_genes=`Nearest Gene`, most_severe=Function, maf=AF1, beta=Effect, se=SE, pval=P) #hg19
+```
+
+# Outcome=ThC
+```{r}
+meta_studies = "KCPS2_GBMI_FinnGen_MVP_ukb_out_GHI_LAT_PMBB"
+dir1 <- "~/Thyroid/sumstats/"
+meta_res <- fread(paste0(dir1,"meta_",meta_studies,"_ThC_hg38.txt.gz"), data.table = F) 
+```
+
+# MR
+```{r}
+# devtools::install_github("MRCIEU/MRInstruments")
+# devtools::install_github("MRCIEU/TwoSampleMR")
+library(MRInstruments);library(TwoSampleMR)
+
+## ---------- Helpers ----------
+# Compute SE from beta and two-sided p (when SE not available)
+p_to_se <- function(beta, p) {
+  z <- qnorm(p / 2, lower.tail = FALSE)
+  abs(beta) / z
+}
+
+# Identify strand-ambiguous palindromic SNPs
+is_palindromic <- function(a1, a2) {
+  paste0(a1, a2) %chin% c("AT","TA","CG","GC")
+}
+
+## ---------- Exposure: build instrument dataset from lead SNPs ----------
+LEAD <- as.data.table(exposure_leadSNPs)
+
+# Standardize columns expected from your lead file (chrom/pos/ref/alt/rsids/beta/pval/maf)
+stopifnot(all(c("chrom","pos","ref","alt","rsids","beta","pval") %in% names(LEAD)))
+
+LEAD[, `:=`(
+  chrom = as.integer(chrom),
+  pos   = as.integer(pos),
+  ref   = toupper(ref),
+  alt   = toupper(alt),
+  rsids = as.character(rsids)
+)]
+
+# Prefer SE if present; otherwise infer from beta+pval
+if (!("se" %in% names(LEAD))) {
+  LEAD[, se := p_to_se(beta, pval)]
+}
+```
+
+```{r}
+# Exposure dataset formatted for TwoSampleMR
+exp_dat <- LEAD[, .(
+  SNP = rsids,                                # use rsID for MR; fallback handled below if missing
+  chr = chrom,
+  pos = pos,
+  effect_allele.exposure = alt,
+  other_allele.exposure  = ref,
+  eaf.exposure = if ("maf" %in% names(LEAD)) maf else NA_real_,
+  beta.exposure = beta,
+  se.exposure   = se,
+  pval.exposure = pval,
+  exposure = "TSH" #"Hyperthyroidism"
+)]
+
+# If any rsids missing/blank, create an ID so they can still be tracked
+exp_dat[is.na(SNP) | SNP == "", SNP := paste0(chr, ":", pos, ":", other_allele.exposure, ":", effect_allele.exposure)]
+```
+
+```{r}
+## ---------- Outcome: extract matching SNPs from meta_res ----------
+ME <- as.data.table(meta_res)
+
+# Standardize
+stopifnot(all(c("CHR","POS","EFFECT_ALLELE","OTHER_ALLELE","BETA","SE","P") %in% names(ME)))
+ME[, `:=`(
+  CHR = as.integer(CHR),
+  POS = as.integer(POS),
+  EFFECT_ALLELE = toupper(EFFECT_ALLELE),
+  OTHER_ALLELE  = toupper(OTHER_ALLELE)
+)]
+
+# Join by position first (robust to SNP naming differences)
+setkey(exp_dat, chr, pos)
+setkey(ME, CHR, POS)
+m <- ME[exp_dat, on = .(CHR = chr, POS = pos), nomatch = 0]
+
+# Keep allele-consistent matches (aligned or swapped); drop mismatches
+m[, match_type := fifelse(
+  EFFECT_ALLELE == effect_allele.exposure & OTHER_ALLELE == other_allele.exposure, "aligned",
+  fifelse(EFFECT_ALLELE == other_allele.exposure & OTHER_ALLELE == effect_allele.exposure, "swapped",
+          "mismatch")
+)]
+m <- m[match_type %chin% c("aligned","swapped")]
+```
+
+```{r}
+# align outcome beta to exposure effect allele
+m[, `:=`(
+  beta.outcome = fifelse(match_type == "aligned", as.numeric(BETA), -as.numeric(BETA)),
+  se.outcome   = as.numeric(SE),
+  pval.outcome = as.numeric(P),
+  eaf.outcome  = if ("Freq1" %in% names(m)) as.numeric(Freq1) else NA_real_,
+  outcome      = "Thyroid cancer",
+  N.outcome    = if ("N" %in% names(m)) as.numeric(N) else NA_real_
+)]
+
+# Build analysis table with BOTH exposure + outcome columns
+dat_tmp <- m[, .(
+  SNP,
+  chr = as.integer(CHR),
+  pos = as.integer(POS),
+
+  effect_allele.exposure,
+  other_allele.exposure,
+  beta.exposure,
+  se.exposure,
+  pval.exposure,
+  eaf.exposure,
+  exposure,
+
+  effect_allele.outcome = effect_allele.exposure,   # by construction after alignment
+  other_allele.outcome  = other_allele.exposure,
+  beta.outcome,
+  se.outcome,
+  pval.outcome,
+  eaf.outcome,
+  outcome,
+  N.outcome
+)]
+```
+
+```{r}
+## ---------- Optional: conservative palindromic filter if EAF available ----------
+pal <- is_palindromic(dat_tmp$effect_allele.exposure, dat_tmp$other_allele.exposure)
+mid_af <- !is.na(dat_tmp$eaf.exposure) & dat_tmp$eaf.exposure > 0.42 & dat_tmp$eaf.exposure < 0.58
+if (any(pal & mid_af)) {
+  message("Dropping palindromic SNPs with intermediate exposure EAF: ", sum(pal & mid_af))
+  dat_tmp <- dat_tmp[!(pal & mid_af)]
+}
+```
+
+```{r}
+## ---------- Harmonise & MR ----------
+# Convert to TwoSampleMR format objects
+dat_tmp <- as.data.frame(dat_tmp)
+
+exp_fmt <- TwoSampleMR::format_data(
+  dat_tmp,
+  type = "exposure",
+  snp_col = "SNP",
+  beta_col = "beta.exposure",
+  se_col = "se.exposure",
+  effect_allele_col = "effect_allele.exposure",
+  other_allele_col  = "other_allele.exposure",
+  eaf_col  = "eaf.exposure",
+  pval_col = "pval.exposure",
+  chr_col  = "chr",
+  pos_col  = "pos"
+)
+
+out_fmt <- TwoSampleMR::format_data(
+  dat_tmp,
+  type = "outcome",
+  snp_col = "SNP",
+  beta_col = "beta.outcome",
+  se_col = "se.outcome",
+  effect_allele_col = "effect_allele.outcome",
+  other_allele_col  = "other_allele.outcome",
+  eaf_col  = "eaf.outcome",
+  pval_col = "pval.outcome",
+  chr_col  = "chr",
+  pos_col  = "pos"
+)
+
+```
+
+```{r}
+dat_h <- harmonise_data(exp_fmt, out_fmt, action = 2)  # action=2 drops incompatible/palindromic problematic SNPs
+
+# Run MR methods
+mr_res <- mr(dat_h, method_list = c(
+  "mr_ivw",
+  "mr_egger_regression",
+  "mr_weighted_median",
+  "mr_weighted_mode"
+))
+```
+
+```{r}
+# Sensitivity
+het <- mr_heterogeneity(dat_h)
+pleio <- mr_pleiotropy_test(dat_h)
+loo <- mr_leaveoneout(dat_h)
+
+print(mr_res)
+print(het)
+print(pleio)
+```
+
+```{r}
+## ---------- Plots ----------
+loo_plot <- mr_leaveoneout_plot(loo)
+scat_plot <- mr_scatter_plot(mr_res, dat_h)
+forest_plot <- mr_forest_plot(mr_singlesnp(dat_h))
+```
+
+# MRPRESSO
+```{r}
+# if (!require("devtools")) { install.packages("devtools") } else {}
+# devtools::install_github("rondolab/MR-PRESSO")
+library(MRPRESSO)
+
+res_presso <- mr_presso(BetaOutcome = "beta.outcome", BetaExposure = "beta.exposure", SdOutcome = "se.outcome", SdExposure = "se.exposure", OUTLIERtest = TRUE, DISTORTIONtest = TRUE, data = dat_h, NbDistribution = 10000,  SignifThreshold = 0.05, seed = 20260309)
+```
+
+## Re-estimate IVW after removing MR-PRESSO outliers
+```{r}
+# 1) Pull MR-PRESSO outlier indices (these are row indices in the data passed to mr_presso)
+outlier_idx <- res_presso$`MR-PRESSO results`$`Distortion Test`$`Outliers Indices`
+
+# Safety checks
+stopifnot(is.numeric(outlier_idx))
+stopifnot(all(outlier_idx >= 1), all(outlier_idx <= nrow(dat_h)))
+
+# 2) Create filtered dataset (remove outlier rows)
+dat_h_no_outliers <- dat_h[-outlier_idx, , drop = FALSE]
+
+cat("Original SNPs:", nrow(dat_h), "\n")
+cat("Outliers removed:", length(outlier_idx), "\n")
+cat("Remaining SNPs:", nrow(dat_h_no_outliers), "\n")
+
+# 3) Re-run MR (IVW only, plus optional other methods for comparison)
+mr_ivw_only <- mr(dat_h_no_outliers, method_list = "mr_ivw")
+print(mr_ivw_only)
+
+# Optional: compare to original IVW on full set
+mr_ivw_full <- mr(dat_h, method_list = "mr_ivw")
+
+# Put side-by-side
+mr_ivw_compare <- rbind(
+  transform(mr_ivw_full, dataset = "Full (all SNPs)"),
+  transform(mr_ivw_only, dataset = "MR-PRESSO outliers removed")
+)
+
+# Keep just key columns (adjust if your TwoSampleMR version uses slightly different names)
+keep_cols <- intersect(
+  c("dataset", "id.exposure", "id.outcome", "exposure", "outcome", "method", "nsnp", "b", "se", "pval"),
+  names(mr_ivw_compare)
+)
+
+mr_ivw_compare <- mr_ivw_compare[, keep_cols, drop = FALSE]
+print(mr_ivw_compare)
+
+# 4) (Recommended) Recompute heterogeneity and pleiotropy diagnostics after outlier removal
+het_no_outliers <- mr_heterogeneity(dat_h_no_outliers)
+print(het_no_outliers)
+
+pleio_no_outliers <- mr_pleiotropy_test(dat_h_no_outliers)
+print(pleio_no_outliers)
+
+# 5) (Optional) Save the filtered harmonized dataset for reproducibility
+# write.csv(dat_h_no_outliers, "harmonized_no_presso_outliers.csv", row.names = FALSE)
+```
+
+```{r}
+mr_res_no_outliers <- mr(dat_h_no_outliers, method_list = c(
+  "mr_ivw",
+  "mr_egger_regression",
+  "mr_weighted_median",
+  "mr_weighted_mode"
+))
+mr_res_no_outliers
+
+het <- mr_heterogeneity(dat_h_no_outliers)
+pleio <- mr_pleiotropy_test(dat_h_no_outliers)
+loo <- mr_leaveoneout(dat_h_no_outliers)
+
+mr_leaveoneout_plot(loo)
+mr_scatter_plot(mr_res_no_outliers, dat_h_no_outliers)
+mr_forest_plot(mr_singlesnp(dat_h_no_outliers))
+```
+
