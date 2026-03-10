@@ -145,6 +145,158 @@ print("Total pipeline runtime:")
 print(end-start)
 #----
 ```
+## Convergence plots for bNMF runs using n.error and n.lambda
+```{r}
+library(tidyverse)
+
+summarize_bnmf_reps <- function(bnmf_reps) {
+  map_dfr(seq_along(bnmf_reps), function(r) {
+    res <- bnmf_reps[[r]]
+    
+    final_iter <- length(res$n.lambda)
+    final_lambda <- res$n.lambda[[final_iter]]
+    
+    tibble(
+      run = r,
+      iterations = final_iter,
+      final_error = res$n.error[[final_iter]],
+      final_evidence = res$n.evid[[final_iter]],
+      K = sum(final_lambda > min(final_lambda)),  # effective K
+      lambda_min = min(final_lambda),
+      lambda_median = median(final_lambda),
+      lambda_max = max(final_lambda)
+    )
+  }) %>% arrange(final_evidence)
+}
+
+run_summary <- summarize_bnmf_reps(bnmf_reps)
+head(run_summary)
+```
+```{r}
+library(tidyverse)
+
+bnmf_run_to_df_safe <- function(res, run_id = 1,
+                               baseline = c("iter_min", "final_min", "none"),
+                               cost_source = c("n.evid", "n.error")) {
+  baseline <- match.arg(baseline)
+  cost_source <- match.arg(cost_source)
+
+  # ---- lambdas ----
+  lam_list <- res$n.lambda
+  lam_list <- lam_list[!sapply(lam_list, is.null)]
+  lam_mat <- do.call(rbind, lapply(lam_list, as.numeric))
+  it_lam <- seq_len(nrow(lam_mat))
+  K <- ncol(lam_mat)
+  colnames(lam_mat) <- paste0("k", seq_len(K))
+
+  # baseline B for lambda_k - B
+  if (baseline == "iter_min") {
+    B_vec <- apply(lam_mat, 1, min, na.rm = TRUE)
+  } else if (baseline == "final_min") {
+    B_final <- min(lam_mat[nrow(lam_mat), ], na.rm = TRUE)
+    B_vec <- rep(B_final, nrow(lam_mat))
+  } else {
+    B_vec <- rep(0, nrow(lam_mat))
+  }
+
+  df_lambda <- as_tibble(lam_mat) %>%
+    mutate(iter = it_lam, run = run_id, B = B_vec) %>%
+    pivot_longer(cols = starts_with("k"),
+                 names_to = "component",
+                 values_to = "lambda") %>%
+    mutate(lambda_minus_B = lambda - B)
+
+  # ---- cost ----
+  cost_list <- res[[cost_source]]
+  cost_list <- cost_list[!sapply(cost_list, is.null)]
+  cost_vec <- unlist(cost_list)
+
+  df_cost <- tibble(
+    run = run_id,
+    iter = seq_along(cost_vec),
+    cost = cost_vec
+  )
+
+  list(df_cost = df_cost, df_lambda = df_lambda)
+}
+
+plot_convergence <- function(bnmf_reps,
+                                       run_id = 1,
+                                       baseline = c("iter_min", "final_min", "none"),
+                                       out_prefix = paste0("bnmf_run", run_id),
+                                       use_lambda_minus_B = TRUE,
+                                       cost_source = c("n.evid", "n.error")) {
+  baseline <- match.arg(baseline)
+  cost_source <- match.arg(cost_source)
+
+  res <- bnmf_reps[[run_id]]
+  dfs <- bnmf_run_to_df_safe(res, run_id = run_id, baseline = baseline, cost_source = cost_source)
+  df_cost <- dfs$df_cost
+  df_lam  <- dfs$df_lambda
+
+  # Middle: cost (log-log)
+  p_cost <- ggplot(df_cost, aes(x = iter, y = cost)) +
+    geom_line(linewidth = 0.6) +
+    scale_x_log10() +
+    scale_y_log10() +
+    labs(
+      title = paste0("cost (run ", run_id, ")"),
+      x = "",
+      y = paste0(cost_source, " (log-log)")
+    ) +
+    theme_bw()
+
+  # Bottom: relevance (log-linear)
+  yvar <- if (use_lambda_minus_B) "lambda_minus_B" else "lambda"
+  ylab <- if (use_lambda_minus_B) expression(lambda[k] - B) else expression(lambda[k])
+
+  p_rel <- ggplot(df_lam, aes(x = iter, y = .data[[yvar]], group = component)) +
+    geom_line(alpha = 0.7, linewidth = 0.35) +
+    scale_x_log10() +
+    labs(
+      title = paste0("relevance (run ", run_id, ")"),
+      x = "iterations",
+      y = ylab
+    ) +
+    theme_bw()
+
+  list(cost_plot = p_cost, relevance_plot = p_rel)
+}
+
+library(cowplot)
+
+plots <- plot_convergence(
+  bnmf_reps,
+  run_id = 1,
+  baseline = "iter_min",
+  out_prefix = "bnmf_run1",
+  use_lambda_minus_B = TRUE,
+  cost_source = "n.evid"
+)
+
+p_stacked <- plot_grid(
+  plots$cost_plot,
+  plots$relevance_plot,
+  ncol = 1,
+  align = "v",
+  rel_heights = c(1, 1.1)
+)
+
+ggsave(
+  "~/bNMF/bnmf_run1_convergence_stacked.pdf",
+  p_stacked,
+  width = 7,
+  height = 6
+)
+
+p_stacked
+
+#check if bNMF converges well before 10,000 iterations across runs
+ggplot(run_summary, aes(x = run, y = iterations)) +
+   geom_point(size = 2) + geom_hline(yintercept = 10000, linetype = "dashed", color = "red") +
+   labs(x = "Run (random initialization)", y = "Iterations to convergence") +
+   theme_bw()
+```
 
 ```{r}
 gwas_traits <- NULL
